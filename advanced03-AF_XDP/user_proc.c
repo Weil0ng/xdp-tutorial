@@ -516,8 +516,17 @@ static void hex_dump(void *pkt, size_t length, u64 addr)
 	char buf[32];
 	int i = 0;
 
-	if (!DEBUG_HEXDUMP)
+	struct in_addr ip;
+	struct ethhdr *eth = (struct ethhdr *)pkt;
+	struct iphdr *ipv4 = (struct iphdr *)(eth + 1);
+
+        if (ntohs(eth->h_proto) != ETH_P_IP) {
 		return;
+	}
+	memcpy(&ip, &ipv4->saddr, sizeof(ip));
+	char *s = inet_ntoa(ip);
+	printf("Got IP: %s\n", s);
+        return;
 
 	sprintf(buf, "addr=%llu", addr);
 	printf("length = %zu\n", length);
@@ -1421,57 +1430,6 @@ static void l2fwd_all(void)
 	}
 }
 
-static void load_xdp_program(char **argv, struct bpf_object **obj)
-{
-	struct bpf_prog_load_attr prog_load_attr = {
-		.prog_type      = BPF_PROG_TYPE_XDP,
-	};
-	char xdp_filename[256];
-	int prog_fd;
-
-	snprintf(xdp_filename, sizeof(xdp_filename), "%s_kern.o", argv[0]);
-	prog_load_attr.file = xdp_filename;
-
-	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
-		exit(EXIT_FAILURE);
-	if (prog_fd < 0) {
-		fprintf(stderr, "ERROR: no program found: %s\n",
-			strerror(prog_fd));
-		exit(EXIT_FAILURE);
-	}
-
-	if (bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags) < 0) {
-		fprintf(stderr, "ERROR: link set xdp fd failed\n");
-		exit(EXIT_FAILURE);
-	}
-}
-
-static void enter_xsks_into_map(struct bpf_object *obj)
-{
-	struct bpf_map *map;
-	int i, xsks_map;
-
-	map = bpf_object__find_map_by_name(obj, "xsks_map");
-	xsks_map = bpf_map__fd(map);
-	if (xsks_map < 0) {
-		fprintf(stderr, "ERROR: no xsks map found: %s\n",
-			strerror(xsks_map));
-			exit(EXIT_FAILURE);
-	}
-
-	for (i = 0; i < num_socks; i++) {
-		int fd = xsk_socket__fd(xsks[i]->xsk);
-		int key, ret;
-
-		key = i;
-		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
-		if (ret) {
-			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
-			exit(EXIT_FAILURE);
-		}
-	}
-}
-
 /*
 static void apply_setsockopt(struct xsk_socket_info *xsk)
 {
@@ -1639,15 +1597,11 @@ int main(int argc, char **argv)
 				strerror(errno));
 			exit(EXIT_FAILURE);
 		}
-
-		if (opt_num_xsks > 1)
-			load_xdp_program(argv, &obj);
 	}
 
 	/*
 	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
 		rx = true;
-		xsk_populate_fill_ring(umem);
 	}
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;
@@ -1682,6 +1636,7 @@ int main(int argc, char **argv)
 	printf("setup complete\n");	
 
 	// Step 5: process packet
+	xsk_populate_fill_ring(umem);
 
 	printf("start polling thread\n");
 	ret = pthread_create(&pt, NULL, poller, NULL);
@@ -1691,6 +1646,7 @@ int main(int argc, char **argv)
 	prev_time = get_nsecs();
 	start_time = prev_time;
 
+	rx_drop_all();
 	/*
 	if (opt_bench == BENCH_RXDROP)
 		rx_drop_all();
