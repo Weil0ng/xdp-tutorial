@@ -20,6 +20,7 @@
 
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <netpacket/packet.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <linux/ipv6.h>
@@ -272,10 +273,47 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+static int setup_fwd_socket(struct config *cfg)
+{
+	// Forward packets
+	struct sockaddr_ll daddr;
+	int sock = socket(PF_PACKET, SOCK_RAW, IPPROTO_RAW);
+	memset(&daddr, 0, sizeof(struct sockaddr_ll));
+	daddr.sll_family = AF_PACKET;
+	daddr.sll_protocol = htons(ETH_P_ALL);
+	char *fwd_ifname;
+	char *orig_ifname = "ens5";
+	if (strcmp(cfg->ifname, orig_ifname) == 0) {
+		char *ifname = "ens6";
+		fwd_ifname = ifname;
+	} else {
+		char *ifname = "ens5";
+		fwd_ifname = ifname;
+	}
+	fprintf(stdout, "fwd ifname: %s\n", fwd_ifname);
+	daddr.sll_ifindex = if_nametoindex(fwd_ifname);
+    	if (bind(sock, (struct sockaddr*)&daddr, sizeof(daddr)) < 0) {
+		fprintf(stderr, "bind failed\n");
+		return -1;
+	}
+	/*
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), fwd_ifname);
+	if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) < 0) {
+		fprintf(stderr, "bindtodevice failed\n");
+		return false;
+	}
+	*/
+	return sock;
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
-			   uint64_t addr, uint32_t len)
+			   uint64_t addr, uint32_t len, int fwd_sock)
 {
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+	write(fwd_sock, pkt, len);
 
         /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
 	 *
@@ -338,7 +376,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	return false;
 }
 
-static void handle_receive_packets(struct xsk_socket_info *xsk)
+static void handle_receive_packets(struct xsk_socket_info *xsk, int fwd_sock)
 {
 	unsigned int rcvd, stock_frames, i;
 	uint32_t idx_rx = 0, idx_fq = 0;
@@ -374,7 +412,7 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 		uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 
-		if (!process_packet(xsk, addr, len))
+		if (!process_packet(xsk, addr, len, fwd_sock))
 			xsk_free_umem_frame(xsk, addr);
 
 		xsk->stats.rx_bytes += len;
@@ -397,14 +435,20 @@ static void rx_and_process(struct config *cfg,
 	fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
 	fds[0].events = POLLIN;
 
+	int fwd_sock = setup_fwd_socket(cfg);
+	if (fwd_sock < 0) {
+		fprintf(stderr, "Opening fwd socket failed");
+		exit(EXIT_FAILURE);
+	}
 	while(!global_exit) {
 		if (cfg->xsk_poll_mode) {
 			ret = poll(fds, nfds, -1);
 			if (ret <= 0 || ret > 1)
 				continue;
 		}
-		handle_receive_packets(xsk_socket);
+		handle_receive_packets(xsk_socket, fwd_sock);
 	}
+	close(fwd_sock);
 }
 
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
