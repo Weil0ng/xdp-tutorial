@@ -48,7 +48,7 @@
 #define PF_XDP AF_XDP
 #endif
 
-#define NUM_FRAMES 8
+#define NUM_FRAMES 4
 #define MIN_PKT_SIZE 64
 
 #define DEBUG_HEXDUMP 0
@@ -73,7 +73,7 @@ static int opt_ifindex;
 static int opt_queue;
 static unsigned long opt_duration;
 static unsigned long start_time;
-static bool benchmark_done = false;
+static bool benchmark_done;
 static u32 opt_batch_size = 64;
 static int opt_pkt_count;
 static u16 opt_pkt_size = MIN_PKT_SIZE;
@@ -153,7 +153,7 @@ struct xsk_socket_info {
 	u32 outstanding_tx;
 };
 
-static int num_socks = 1;
+static int num_socks;
 struct xsk_socket_info *xsks[MAX_SOCKS];
 int sock;
 
@@ -452,7 +452,7 @@ static bool is_benchmark_done(void)
 static void *poller(void *arg)
 {
 	(void)arg;
-	while (!benchmark_done) {
+	while (!is_benchmark_done()) {
 		sleep(opt_interval);
 		dump_stats();
 	}
@@ -495,6 +495,25 @@ static void __exit_with_error(int error, const char *file, const char *func,
 
 #define exit_with_error(error) __exit_with_error(error, __FILE__, __func__, __LINE__)
 
+static void xdpsock_cleanup(void)
+{
+	struct xsk_umem *umem = xsks[0]->umem->umem;
+	int i, cmd = CLOSE_CONN;
+
+	dump_stats();
+	for (i = 0; i < num_socks; i++)
+		xsk_socket__delete(xsks[i]->xsk);
+	(void)xsk_umem__delete(umem);
+
+	if (opt_reduced_cap) {
+		if (write(sock, &cmd, sizeof(int)) < 0)
+			exit_with_error(errno);
+	}
+
+	if (opt_num_xsks > 1)
+		remove_xdp_program();
+}
+
 static void swap_mac_addresses(void *data)
 {
 	struct ether_header *eth = (struct ether_header *)data;
@@ -516,17 +535,8 @@ static void hex_dump(void *pkt, size_t length, u64 addr)
 	char buf[32];
 	int i = 0;
 
-	struct in_addr ip;
-	struct ethhdr *eth = (struct ethhdr *)pkt;
-	struct iphdr *ipv4 = (struct iphdr *)(eth + 1);
-
-        if (ntohs(eth->h_proto) != ETH_P_IP) {
+	if (!DEBUG_HEXDUMP)
 		return;
-	}
-	memcpy(&ip, &ipv4->saddr, sizeof(ip));
-	char *s = inet_ntoa(ip);
-	printf("Got IP: %s\n", s);
-        return;
 
 	sprintf(buf, "addr=%llu", addr);
 	printf("length = %zu\n", length);
@@ -788,7 +798,7 @@ static void gen_eth_frame(struct xsk_umem_info *umem, u64 addr)
 	       PKT_SIZE);
 }
 
-static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size, int fd)
+static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 {
 	struct xsk_umem_info *umem;
 	struct xsk_umem_config cfg = {
@@ -813,8 +823,8 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size, int fd)
 	if (!umem)
 		exit_with_error(errno);
 
-	ret = xsk_umem__create_with_fd(&umem->umem, buffer, size, &umem->fq, &umem->cq,
-			       &cfg, fd);
+	ret = xsk_umem__create(&umem->umem, buffer, size, &umem->fq, &umem->cq,
+			       &cfg);
 	if (ret)
 		exit_with_error(-ret);
 
@@ -838,7 +848,7 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
-						    int *socket_fd, bool rx, bool tx)
+						    bool rx, bool tx)
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -862,20 +872,14 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
-
-	printf("xsk_socket__create_with_fd\n");
-	ret = xsk_socket__create_with_fd(&xsk->xsk, opt_if, opt_queue, umem->umem,
-				 rxr, txr, &cfg, *socket_fd);
-	if (ret) {
-		printf("Error in xsk_socket__create_with_fd\n");
+	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
+				 rxr, txr, &cfg);
+	if (ret)
 		exit_with_error(-ret);
-	}
-	printf("xsk_socket__create_with_fd done\n");
-	/*
+
 	ret = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
 	if (ret)
 		exit_with_error(-ret);
-	*/
 
 	xsk->app_stats.rx_empty_polls = 0;
 	xsk->app_stats.fill_fail_polls = 0;
@@ -1430,6 +1434,57 @@ static void l2fwd_all(void)
 	}
 }
 
+static void load_xdp_program(char **argv, struct bpf_object **obj)
+{
+	struct bpf_prog_load_attr prog_load_attr = {
+		.prog_type      = BPF_PROG_TYPE_XDP,
+	};
+	char xdp_filename[256];
+	int prog_fd;
+
+	snprintf(xdp_filename, sizeof(xdp_filename), "%s_kern.o", argv[0]);
+	prog_load_attr.file = xdp_filename;
+
+	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
+		exit(EXIT_FAILURE);
+	if (prog_fd < 0) {
+		fprintf(stderr, "ERROR: no program found: %s\n",
+			strerror(prog_fd));
+		exit(EXIT_FAILURE);
+	}
+
+	if (bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags) < 0) {
+		fprintf(stderr, "ERROR: link set xdp fd failed\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void enter_xsks_into_map(struct bpf_object *obj)
+{
+	struct bpf_map *map;
+	int i, xsks_map;
+
+	map = bpf_object__find_map_by_name(obj, "xsks_map");
+	xsks_map = bpf_map__fd(map);
+	if (xsks_map < 0) {
+		fprintf(stderr, "ERROR: no xsks map found: %s\n",
+			strerror(xsks_map));
+			exit(EXIT_FAILURE);
+	}
+
+	for (i = 0; i < num_socks; i++) {
+		int fd = xsk_socket__fd(xsks[i]->xsk);
+		int key, ret;
+
+		key = i;
+		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
+		if (ret) {
+			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
 /*
 static void apply_setsockopt(struct xsk_socket_info *xsk)
 {
@@ -1455,99 +1510,56 @@ static void apply_setsockopt(struct xsk_socket_info *xsk)
 }
 */
 
-static int recv_xsk_fd_from_ctrl_node(int sock, int *_fd)
+int send_fds(int socket, int *fds, int n)  // send fd by socket
 {
-	char cms[CMSG_SPACE(sizeof(int))];
-	struct cmsghdr *cmsg;
-	struct msghdr msg;
-	struct iovec iov;
-	int value;
-	int len;
+        struct msghdr msg = {0};
+        struct cmsghdr *cmsg;
+        char buf[CMSG_SPACE(n * sizeof(int))], dup[256];
+        memset(buf, '\0', sizeof(buf));
+        struct iovec io = { .iov_base = &dup, .iov_len = sizeof(dup) };
 
-	iov.iov_base = &value;
-	iov.iov_len = sizeof(int);
+        msg.msg_iov = &io;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf;
+        msg.msg_controllen = sizeof(buf);
 
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_flags = 0;
-	msg.msg_control = (caddr_t)cms;
-	msg.msg_controllen = sizeof(cms);
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(n * sizeof(int));
 
-	len = recvmsg(sock, &msg, 0);
+        memcpy((int *)CMSG_DATA(cmsg), fds, n * sizeof(int));
 
-	if (len < 0) {
-		fprintf(stderr, "Recvmsg failed length incorrect.\n");
-		return -EINVAL;
-	}
-
-	if (len == 0) {
-		fprintf(stderr, "Recvmsg failed no data\n");
-		return -EINVAL;
-	}
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	*_fd = *(int *)CMSG_DATA(cmsg);
-
-	return 0;
+        if (sendmsg(socket, &msg, 0) < 0) {
+                printf("Failed to send message\n");
+                return 1;
+        }
+        return 0;
 }
 
-static int
-recv_xsk_fd(int *xsk_fd)
+static int send_xsk_fds(int *xsk_fd, int n)
 {
-	int client_sock;
 	struct sockaddr_un server;
-	int err;
+	int sock;
+	int flag = 1;
 
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0) {
-		fprintf(stderr, "Error opening socket stream: %s", strerror(errno));
-		return errno;
+		fprintf(stderr, "Openning socket stream failed: %s", strerror(errno));
+		return -errno;
 	}
 
 	server.sun_family = AF_UNIX;
 	strcpy(server.sun_path, SOCKET_NAME);
+	
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
 
-	if (bind(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
-		close(sock);
-		fprintf(stderr, "Error binding stream socket: %s", strerror(errno));
-		return errno;
-	}
-
-	if (listen(sock, 5)) {
-		close(sock);
-		fprintf(stderr, "Error listening to domain socket %s", strerror(errno));
+	if (connect(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un))) {
+		fprintf(stderr, "Failed to connect to socket: %s\n", strerror(errno));
 		return -errno;
-	}
-
-	client_sock = accept(sock, 0, 0);
-	if (client_sock == -1) {
-		close(sock);
-		fprintf(stderr, "Error accespting connection: %s", strerror(errno));
-		return -errno;
-	}
-
-	err = recv_xsk_fd_from_ctrl_node(client_sock, xsk_fd);
-	if (err) {
-		fprintf(stderr, "Error %d receiving fd\n", err);
-		return -errno;
-	}
-	return client_sock;
-}
-
-int send_completion(int sock) {
-	const char* msg = "I'm done";
-	int ret;
-
-       	ret = write(sock, &msg, sizeof(msg));
-
-	if (ret == -1) {
-		fprintf(stderr, "sendmsg failed with %s\n", strerror(errno));
-		return -errno;
-	}
-
-	return ret;
+        }
+		
+	return send_fds(sock, xsk_fd, n);
 }
 
 int main(int argc, char **argv)
@@ -1555,25 +1567,17 @@ int main(int argc, char **argv)
 	struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
 	struct __user_cap_data_struct data[2] = { { 0 } };
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
-	struct rlimit cur_limit = {};
 	bool rx = false, tx = false;
 	struct xsk_umem_info *umem;
 	struct bpf_object *obj;
-	int socket_fd = -1, client_sock;
+	int queue_id = 0, umem_fd;
 	pthread_t pt;
-	int ret;
+	int i, ret;
 	void *bufs;
 
 	parse_command_line(argc, argv);
 
-	signal(SIGINT, int_exit);
-	signal(SIGTERM, int_exit);
-	signal(SIGABRT, int_exit);
-	setlocale(LC_ALL, "");
-
 	if (opt_reduced_cap) {
-		getrlimit(RLIMIT_MEMLOCK, &cur_limit);
-		printf("MEMLOCK limit: %u %u\n", cur_limit.rlim_cur, cur_limit.rlim_max);
 		if (capget(&hdr, data)  < 0)
 			fprintf(stderr, "Error getting capabilities\n");
 
@@ -1597,26 +1601,11 @@ int main(int argc, char **argv)
 				strerror(errno));
 			exit(EXIT_FAILURE);
 		}
+
+		if (opt_num_xsks > 1)
+			load_xdp_program(argv, &obj);
 	}
 
-	/*
-	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
-		rx = true;
-	}
-	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
-		tx = true;
-	*/
-
-	// Step 1: recv socket fd
-	client_sock = recv_xsk_fd(&socket_fd);	
-	printf("Received socket fd: %d\n", socket_fd);
-	if (client_sock < 0) {
-		printf("Error recving fd: %s", strerror(errno));
-		exit(1);
-	}
-
-	// Step 2: create umem.
-	
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
 	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
 		    PROT_READ | PROT_WRITE,
@@ -1626,39 +1615,72 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size, socket_fd);
+	/* Create sockets... */
+	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
+	umem_fd = xsk_umem__fd(umem);
+	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
+		rx = true;
+		xsk_populate_fill_ring(umem);
+	}
+	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
+		tx = true;
 
-	// Step 3: setup xsk socket
-	xsks[0] = xsk_configure_socket(umem, &socket_fd, true, true);
+	/*
+	for (i = 0; i < opt_num_xsks; i++)
+		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
+	*/
 
-	// Step 4: send completion
-	send_completion(client_sock);
-	printf("setup complete\n");	
+	printf("Created umem fd: %d\n", umem_fd);
+	//for (i = 0; i < opt_num_xsks; i++)
+	//	apply_setsockopt(xsks[i]);
 
-	// Step 5: process packet
-	xsk_populate_fill_ring(umem);
+	if (opt_bench == BENCH_TXONLY) {
+		gen_eth_hdr_data();
 
-	printf("start polling thread\n");
-	ret = pthread_create(&pt, NULL, poller, NULL);
-	if (ret)
-		exit_with_error(ret);
+		for (i = 0; i < NUM_FRAMES; i++)
+			gen_eth_frame(umem, i * opt_xsk_frame_size);
+	}
+
+	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
+		enter_xsks_into_map(obj);
+
+	if (opt_reduced_cap) {
+		int fd[2] = {umem_fd, queue_id};
+		ret = send_xsk_fds(&fd, 2);
+		if (ret) {
+			fprintf(stderr, "Send socket fd failed(%d)\n", ret);
+			exit_with_error(errno);
+		}
+	}
+
+	signal(SIGINT, int_exit);
+	signal(SIGTERM, int_exit);
+	signal(SIGABRT, int_exit);
+
+	setlocale(LC_ALL, "");
+
+	if (!opt_quiet) {
+		ret = pthread_create(&pt, NULL, poller, NULL);
+		if (ret)
+			exit_with_error(ret);
+	}
 
 	prev_time = get_nsecs();
 	start_time = prev_time;
 
-	rx_drop_all();
-	/*
 	if (opt_bench == BENCH_RXDROP)
 		rx_drop_all();
 	else if (opt_bench == BENCH_TXONLY)
 		tx_only_all();
 	else
 		l2fwd_all();
-	*/
 
-	pthread_join(pt, NULL);
+	benchmark_done = true;
 
-	unlink(SOCKET_NAME);
+	if (!opt_quiet)
+		pthread_join(pt, NULL);
+
+	xdpsock_cleanup();
 
 	munmap(bufs, NUM_FRAMES * opt_xsk_frame_size);
 

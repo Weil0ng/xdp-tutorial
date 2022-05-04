@@ -1494,11 +1494,11 @@ static int recv_xsk_fd_from_ctrl_node(int sock, int *_fd)
 }
 
 static int
-recv_xsk_fd(int *xsk_fd)
+send_socket_fd(int xsk_fd)
 {
-	int client_sock;
+	int dup_fd = dup(xsk_fd);
+	int flag = 1;
 	struct sockaddr_un server;
-	int err;
 
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0) {
@@ -1509,31 +1509,40 @@ recv_xsk_fd(int *xsk_fd)
 	server.sun_family = AF_UNIX;
 	strcpy(server.sun_path, SOCKET_NAME);
 
-	if (bind(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
+
+	if (connect(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un))) {
 		close(sock);
-		fprintf(stderr, "Error binding stream socket: %s", strerror(errno));
+		fprintf(stderr, "Error connecting stream socket: %s", strerror(errno));
 		return errno;
 	}
+	
+	char cmsgbuf[CMSG_SPACE(sizeof(int))];
+	struct msghdr msg;
+	struct iovec iov;
+	int value = 0;
 
-	if (listen(sock, 5)) {
-		close(sock);
-		fprintf(stderr, "Error listening to domain socket %s", strerror(errno));
-		return -errno;
-	}
+	iov.iov_base = &value;
+	iov.iov_len = sizeof(int);
 
-	client_sock = accept(sock, 0, 0);
-	if (client_sock == -1) {
-		close(sock);
-		fprintf(stderr, "Error accespting connection: %s", strerror(errno));
-		return -errno;
-	}
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_flags = 0;
+	msg.msg_control = cmsgbuf;
+	msg.msg_controllen = CMSG_LEN(sizeof(int));
 
-	err = recv_xsk_fd_from_ctrl_node(client_sock, xsk_fd);
-	if (err) {
-		fprintf(stderr, "Error %d receiving fd\n", err);
-		return -errno;
-	}
-	return client_sock;
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+
+	*(int *)CMSG_DATA(cmsg) = dup_fd;
+	int ret = sendmsg(sock, &msg, 0);
+
+	return ret;
 }
 
 int send_completion(int sock) {
@@ -1550,6 +1559,32 @@ int send_completion(int sock) {
 	return ret;
 }
 
+int open_xsk_socket() {
+	int fd;
+
+	fd = socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		printf("open socker failed\n");
+		exit(EXIT_FAILURE);
+	}
+	return fd;
+}
+
+int bind_xsk_socket(int fd, int ifindex, int qid) {
+	struct sockaddr_xdp sxdp = {};
+
+	sxdp.sxdp_family = PF_XDP;
+	sxdp.sxdp_ifindex = ifindex;
+	sxdp.sxdp_queue_id = qid;
+	sxdp.sxdp_flags = XDP_USE_NEED_WAKEUP | XDP_FLAGS_SKB_MODE;
+	printf("Binding %d to ifindex %d queue %d\n", fd, ifindex, qid);
+	if (bind(fd, (struct sockaddr *)&sxdp, sizeof(struct sockaddr_xdp))) {
+		fprintf(stderr, "bind socket failed\n");
+		exit(EXIT_FAILURE);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
@@ -1559,7 +1594,7 @@ int main(int argc, char **argv)
 	bool rx = false, tx = false;
 	struct xsk_umem_info *umem;
 	struct bpf_object *obj;
-	int socket_fd = -1, client_sock;
+	int socket_fd = -1;
 	pthread_t pt;
 	int ret;
 	void *bufs;
@@ -1607,13 +1642,8 @@ int main(int argc, char **argv)
 		tx = true;
 	*/
 
-	// Step 1: recv socket fd
-	client_sock = recv_xsk_fd(&socket_fd);	
-	printf("Received socket fd: %d\n", socket_fd);
-	if (client_sock < 0) {
-		printf("Error recving fd: %s", strerror(errno));
-		exit(1);
-	}
+	// Step 1: create socket
+	socket_fd = open_xsk_socket();
 
 	// Step 2: create umem.
 	
@@ -1631,9 +1661,12 @@ int main(int argc, char **argv)
 	// Step 3: setup xsk socket
 	xsks[0] = xsk_configure_socket(umem, &socket_fd, true, true);
 
-	// Step 4: send completion
-	send_completion(client_sock);
+	ret = bind_xsk_socket(socket_fd, opt_ifindex, opt_queue);
 	printf("setup complete\n");	
+
+	// Step 4: send socket fd
+	send_socket_fd(socket_fd);
+	printf("socket sent\n");	
 
 	// Step 5: process packet
 	xsk_populate_fill_ring(umem);
