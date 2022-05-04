@@ -68,17 +68,15 @@ static void parse_command_line(int argc, char **argv)
 	}
 }
 
-static int send_xsk_fd(int sock, int fd)
+static int recv_xsk_fd(int sock, int *fd)
 {
 	char cmsgbuf[CMSG_SPACE(sizeof(int))];
+	struct cmsghdr *cmsg;
 	struct msghdr msg;
 	struct iovec iov;
 	int value = 0;
+	int len = 0;
 
-	if (fd == -1) {
-		fprintf(stderr, "Incorrect fd = %d\n", fd);
-		return -1;
-	}
 	iov.iov_base = &value;
 	iov.iov_len = sizeof(int);
 
@@ -90,16 +88,21 @@ static int send_xsk_fd(int sock, int fd)
 	msg.msg_control = cmsgbuf;
 	msg.msg_controllen = CMSG_LEN(sizeof(int));
 
-	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+	len = recvmsg(sock, &msg, 0);
+	if (len < 0) {
+		fprintf(stderr, "Recvmsg failed length incorrect.\n");
+		return -EINVAL;
+	}
 
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = SCM_RIGHTS;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	if (len == 0) {
+		fprintf(stderr, "Recvmsg failed no data\n");
+		return -EINVAL;
+	}
 
-	*(int *)CMSG_DATA(cmsg) = fd;
-	int ret = sendmsg(sock, &msg, 0);
+	cmsg = CMSG_FIRSTHDR(&msg);
+	*fd = *(int *)CMSG_DATA(cmsg);
 
-	return ret;
+	return 0;
 }
 
 int open_xsk_socket() {
@@ -159,7 +162,7 @@ main(int argc, char **argv)
 		handle_error("Unable to get ifindex");
 	}
 
-	// Step 1: open domain socket to transmit fds later.
+	// Step 1: open domain socket to receive fds later.
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0) {
 		handle_error("Unable to open domain socket");
@@ -168,39 +171,32 @@ main(int argc, char **argv)
 	server.sun_family = AF_UNIX;
 	strcpy(server.sun_path, SOCKET_NAME);
 
-	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
-
-	if (connect(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un))) {
-		handle_error("Connecting to domain socket failed");
+	if (bind(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
+		close(sock);
+		handle_error("Create domain socket failed");
 	}
 
-	// Step 2: open af_xdp socket
-	socket_fd = open_xsk_socket();
+	if (listen(sock, 5)) {
+		close(sock);
+		handle_error("Listening on domain socket failed");
+	}
+
+	int client_sock =  accept(sock, 0, 0);
+	if (client_sock == -1) {
+		close(sock);
+		handle_error("Accepting domain socket failed");
+	}
+
+	err = recv_xsk_fd(client_sock, &socket_fd);
+	if (err) {
+		handle_error("Receiving socket fd failed");
+	}
 	if (socket_fd < 0) {
 		handle_error("Failed to open socket fd");
 	}
-	printf("Created xdp socket fd: %d\n", socket_fd);
+	printf("Recieved xdp socket fd: %d\n", socket_fd);
 
-	// Step 3: send socket fd to container
-	dup_fd = dup(socket_fd);
-	err = send_xsk_fd(sock, dup_fd);
-	if (err < 0) {
-		handle_error("Send socket fd failed");
-	}
-
-	// Step 4: get setup completion from container
-	err = recv_setup_done(sock);
-	if (err < 0) {
-		handle_error("Recv setup completion failed");
-	}
-	
-        // Step 5: bind socket
-	err = bind_xsk_socket(socket_fd, ifindex, queue_id);
-	if (err) {
-		handle_error("Bind socket failed");
-	}
-
-	// Step 6: load xdp prog
+	// Step 2: load xdp prog
 	/*
 	err = xsk_setup_xdp_prog(ifindex, &xsks_map_fd);
 	if (err) {
@@ -208,7 +204,7 @@ main(int argc, char **argv)
 	}
 	*/
 
-	// Step 7: update xsk map
+	// Step 3: update xsk map
 	xsks_map_fd = bpf_map_get_fd_by_id(opt_map_id); 
 	err = update_xsk_map(xsks_map_fd, &queue_id, &socket_fd);
 	if (err) {
