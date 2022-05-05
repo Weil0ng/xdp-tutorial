@@ -1,0 +1,8 @@
+0. On the host, load xdp for pod
+	nsenter -t <pid_of_container> -n ip link set dev eth0 xdp obj xdp_kern.o sec xdp_sock
+1. Get map id
+	bpftool map list
+2. On the host, run ./host_proc_veth -i <if> -m <map_id>
+3. Inside the container, run ./user_proc_veth -i eth0 -R
+4. On the host, load xdp for eth0
+	./load_xdp_prog.sh <if>
