@@ -788,7 +788,7 @@ static void gen_eth_frame(struct xsk_umem_info *umem, u64 addr)
 	       PKT_SIZE);
 }
 
-static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size, int fd)
+static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 {
 	struct xsk_umem_info *umem;
 	struct xsk_umem_config cfg = {
@@ -813,8 +813,8 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size, int fd)
 	if (!umem)
 		exit_with_error(errno);
 
-	ret = xsk_umem__create_with_fd(&umem->umem, buffer, size, &umem->fq, &umem->cq,
-			       &cfg, fd);
+	ret = xsk_umem__create(&umem->umem, buffer, size, &umem->fq, &umem->cq,
+			       &cfg);
 	if (ret)
 		exit_with_error(-ret);
 
@@ -838,7 +838,7 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
-						    int *socket_fd, bool rx, bool tx)
+						    bool rx, bool tx)
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -863,14 +863,12 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
 
-	printf("xsk_socket__create_with_fd\n");
-	ret = xsk_socket__create_with_fd(&xsk->xsk, opt_if, opt_queue, umem->umem,
-				 rxr, txr, &cfg, *socket_fd);
+	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
+				 rxr, txr, &cfg);
 	if (ret) {
 		printf("Error in xsk_socket__create_with_fd\n");
 		exit_with_error(-ret);
 	}
-	printf("xsk_socket__create_with_fd done\n");
 	/*
 	ret = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
 	if (ret)
@@ -1642,10 +1640,7 @@ int main(int argc, char **argv)
 		tx = true;
 	*/
 
-	// Step 1: create socket
-	socket_fd = open_xsk_socket();
-
-	// Step 2: create umem.
+	// Step 1: create umem.
 	
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
 	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
@@ -1656,12 +1651,11 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size, socket_fd);
+	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
 
 	// Step 3: setup xsk socket
-	xsks[0] = xsk_configure_socket(umem, &socket_fd, true, true);
-
-	ret = bind_xsk_socket(socket_fd, opt_ifindex, opt_queue);
+	xsks[0] = xsk_configure_socket(umem, true, true);
+	socket_fd = xsk_socket__fd(xsks[0]->xsk); 
 	printf("setup complete\n");	
 
 	// Step 4: send socket fd
